@@ -109,8 +109,8 @@ int my_open_listenfd(char *port)
     // 이미 연결이 선행되었으므로 해당 포트로 오는 요청 다 listen하면 됨. 그래서 hostname 지정이 필요 없음.
     getaddrinfo(NULL, port, &hints, &listp);
 
-    for (p=listp; p; p->ai_next) {
-        if (listenfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol) < 0)
+    for (p=listp; p; p=p->ai_next) {
+        if ((listenfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0)
             continue;
         // 여기까지 이전 서버와 같음
 
@@ -120,17 +120,17 @@ int my_open_listenfd(char *port)
 
         if (bind(listenfd, p->ai_addr, p->ai_addrlen) == 0)
             break;
-        close(listen);
+        close(listenfd);
     }
     freeaddrinfo(listp);
     if (!p)
         return -1;
         // listen(연결대기하는소켓, 대기열의 최대 크기-1024로 정의)
-    if (listen(listenfd, LISTENQ < 0)) { // listen은이 소켓으로 클라이언트 연결 받을 준비 됐어 라고 OS에 알려주는 것
+    if (listen(listenfd, LISTENQ) < 0) { // listen은이 소켓으로 클라이언트 연결 받을 준비 됐어 라고 OS에 알려주는 것
         close(listenfd); // OS가 이 소켓을 대기 상태로 만들어줄수 없는 경우 바로 닫음
         return -1;
     }
-    return -1;
+    return listenfd;
 }
 
 /*
@@ -172,26 +172,54 @@ int my_client_main(int argc, char **argv)
     // 앞으로 rio를 이용해서 clientfd, 즉 서버가 보내는 데이터를 buffered 방식으로 읽겠다.
     Rio_readinitb(&rio, clientfd);
 
+    // 사용자 입력을 한 줄씩 읽어오는 반복문
     while (Fgets(buf, MAXLINE, stdin) != NULL) {
+        // 사용자가 입력한 내용을 서버로 전송
+        // Rio_writen: fd에 주어진 n바이트를 끝까지 쓰는 함수(루프돌림)
+        //             여기서는 clientfd가 서버와 연결된 소켓 fd라서, 그 fd에 쓰면 데이터가 서버로 가는 것
         Rio_writen(clientfd, buf, strlen(buf));
-        Rio_readinitb();
+        // 서버가 echo해서 돌려준 응답을 buf애 저장
+        Rio_readlineb(&rio, buf, MAXLINE);
+        // 서버 응답을 화면에 출력
+        Fputs(buf, stdout);
     }
+    close(clientfd);
+    exit(0);
+
 }
 
 int main(int argc, char **argv)
 {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <port>\n", argv[0]);
-        exit(1);
-    }
-
     /*
      * TODO:
      * 1. my_open_listenfd(argv[1])로 listen 소켓을 연다.
      * 2. 반복문 안에서 클라이언트 연결을 accept한다.
      * 3. echo(connfd)를 호출한 뒤 connfd를 닫는다.
      */
-    return 0;
+    // listenfd는 연결 요청을 계속 기다리고, 클라이언트가 오면 connfd를 새로 만들어서 그 클라이언트랑 통신
+    int listenfd, connfd; // 접속을 기다리는 서버 소켓, 실제 클라이언트와 통신하는 소켓
+    socklen_t clientlen; // 클라이언트 주소 구조체 크기
+    struct sockaddr_storage clientaddr; // 클라이언트 주소 정보
+    char client_hostname[MAXLINE], client_port[MAXLINE]; // IP, Port
+
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <port>\n", argv[0]);
+        exit(1);
+    }
+
+    listenfd = my_open_listenfd(argv[1]); // 포트번호로 서버 소켓열기
+    // 서버 끄기 전까지 계속 도는 무한루프
+    while (1) {
+        clientlen = sizeof(struct sockaddr_storage);
+        // 클라이언트가 연결 요청을 보내면 수락하고, 클라이언트 전용 새 소켓(connfd)반환
+        connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+        // 클라이언트의 IP 주소와 포트번호를 사람이 읽을 수 있는 문자열로 변환해주는 함수
+        Getnameinfo((SA *) &clientaddr, clientlen, client_hostname, MAXLINE, client_port, MAXLINE, 0);
+        printf("Connected to (%s, %s)\n", client_hostname, client_port);
+        echo(connfd); // 에코서버 핵심: 클라이언트가 보낸 데이터를 그대로 돌려줌
+        close(connfd);
+    }
+    exit(0);
 }
 
 static void echo(int connfd)
@@ -210,5 +238,13 @@ static void echo(int connfd)
      *   5. Rio_writen(connfd, buf, n)으로 읽은 내용을 그대로 다시 보낸다.
      *   6. 필요하면 서버 터미널에 받은 바이트 수와 내용을 출력한다.
      */
-    (void)connfd;
+    size_t n;
+    char buf[MAXLINE];
+    rio_t rio;
+
+    Rio_readinitb(&rio, connfd);
+    while ((n = Rio_readlineb(&rio, buf, MAXLINE)) != 0) {
+        printf("server received %d bytes \n", (int)n);
+        Rio_writen(connfd, buf, n);
+    }
 }
